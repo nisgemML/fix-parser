@@ -172,20 +172,18 @@ public:
     bool on_recv(std::span<char const> raw) {
         // Parse header.
         auto result = Parser::parse(raw, [](Field) {});
-        if (!result.valid) {
-            if (cbs_.on_error) cbs_.on_error("checksum failure or malformed message");
+        if (result.error != ParseError::Ok) {
+            if (cbs_.on_error) cbs_.on_error(to_string(result.error));
+            return false;
+        }
+        if (result.msg_type_char == 0 || result.seq_num == 0) {
+            if (cbs_.on_error) cbs_.on_error("missing MsgType or MsgSeqNum");
             return false;
         }
 
-        // Fast-parse for MsgType and SeqNum.
-        auto fast = Parser::parse_fast(raw);
-        if (!fast) {
-            if (cbs_.on_error) cbs_.on_error("missing MsgType or SeqNum");
-            return false;
-        }
-
-        std::string_view msg_type = fast->msg_type;
-        uint64_t         seq      = fast->seq_num;
+        char             mt[2]    = { char(result.msg_type_char), 0 };
+        std::string_view msg_type = mt;
+        uint64_t         seq      = result.seq_num;
 
         // ── Sequence number check (except Sequence Reset) ─────────────────
         if (msg_type != "4") {  // "4" = SequenceReset
@@ -258,10 +256,11 @@ private:
 
     bool handle_logon(std::span<char const>, uint64_t) {
         if (state_ == SessionState::LoggingOn || state_ == SessionState::Connected) {
+            const bool we_are_acceptor = (state_ == SessionState::Connected);
             transition(SessionState::LoggedOn);
             last_recv_time_ = now();
             // Send Logon response if we didn't initiate.
-            if (state_ == SessionState::Connected) {
+            if (we_are_acceptor) {
                 std::string body;
                 body += "108="; body += std::to_string(cfg_.heartbeat_interval_s); body += '\x01';
                 send("A", body);
@@ -292,7 +291,7 @@ private:
         // Reply with Heartbeat carrying the same TestReqID (tag 112).
         std::string_view test_req_id = "TEST";
         // Extract tag 112 from raw.
-        Parser::parse(raw, [&](Field f) {
+        (void)Parser::parse(raw, [&](Field f) {
             if (f.tag == 112) test_req_id = f.value;
         });
         std::string body = "112=";
@@ -307,7 +306,7 @@ private:
         // For simplicity: respond with GapFill (SequenceReset).
         // In production: replay stored messages.
         uint64_t begin_seq = 0, end_seq = 0;
-        Parser::parse(raw, [&](Field f) {
+        (void)Parser::parse(raw, [&](Field f) {
             if (f.tag == 7)  std::from_chars(f.value.data(), f.value.data() + f.value.size(), begin_seq);
             if (f.tag == 16) std::from_chars(f.value.data(), f.value.data() + f.value.size(), end_seq);
         });
@@ -321,7 +320,7 @@ private:
 
     bool handle_sequence_reset(std::span<char const> raw, uint64_t) {
         uint64_t new_seq = 0;
-        Parser::parse(raw, [&](Field f) {
+        (void)Parser::parse(raw, [&](Field f) {
             if (f.tag == 36) std::from_chars(f.value.data(), f.value.data() + f.value.size(), new_seq);
         });
         if (new_seq > 0) incoming_seq_ = new_seq;
@@ -330,7 +329,7 @@ private:
 
     bool handle_reject(std::span<char const> raw, uint64_t seq) {
         std::string_view reason = "rejected";
-        Parser::parse(raw, [&](Field f) {
+        (void)Parser::parse(raw, [&](Field f) {
             if (f.tag == 58) reason = f.value;
         });
         if (cbs_.on_reject) cbs_.on_reject(seq, reason);

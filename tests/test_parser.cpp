@@ -1,39 +1,16 @@
-// tests/test_parser.cpp — Correctness tests for FIX 4.2/4.4 parser.
+// tests/test_parser.cpp — Correctness tests for the FIX 4.2/4.4 parser.
+#include "test_util.hpp"
+#include <random>
+#include <vector>
 
-#include "fix/parser.hpp"
-#include <cstdio>
-#include <string>
+using fix::Parser; using fix::ParseError; using fix::Field;
 
-static int passed = 0, failed = 0;
-
-#define CHECK(cond, msg) \
-    do { if (!(cond)) { \
-        fprintf(stderr, "  FAIL [%s:%d] %s\n", __FILE__, __LINE__, msg); \
-        ++failed; \
-    } else { ++passed; } } while(0)
-
-static std::string fix_msg(const char* s) {
-    std::string out;
-    for (const char* p = s; *p; ++p)
-        out += (*p == '|') ? '\x01' : *p;
-    return out;
-}
-
-static std::string checksum_field(const std::string& body) {
-    uint8_t cs = fix::compute_checksum({body.data(), body.size()});
-    char buf[16];
-    snprintf(buf, sizeof(buf), "10=%03d\x01", int(cs));
-    return buf;
-}
-
-void test_new_order_single_basic() {
+static void test_new_order_single_basic() {
     printf("NewOrderSingle basic parse:\n");
-    std::string header = fix_msg("8=FIX.4.2|9=178|35=D|49=SENDER|56=TARGET|34=1|52=20230901-09:30:00.000|");
-    std::string body   = fix_msg("11=CLORD001|21=1|55=AAPL|54=1|60=20230901-09:30:00|38=100|40=2|44=15025|");
-    std::string full   = header + body + checksum_field(header + body);
-    auto span  = std::span<const char>(full.data(), full.size());
-    auto order = fix::NewOrderSingle::from(span);
-    CHECK(order.has_value(),          "NewOrderSingle parsed");
+    auto full = build(soh("35=D|49=SENDER|56=TARGET|34=1|52=20230901-09:30:00.000|"
+                          "11=CLORD001|21=1|55=AAPL|54=1|60=20230901-09:30:00|38=100|40=2|44=15025|"));
+    auto order = fix::NewOrderSingle::from(sp(full));
+    CHECK(order.has_value(),              "NewOrderSingle parsed");
     CHECK(order->cl_ord_id == "CLORD001", "ClOrdID correct");
     CHECK(order->symbol    == "AAPL",     "Symbol correct");
     CHECK(order->side      == '1',        "Side=Buy");
@@ -42,143 +19,177 @@ void test_new_order_single_basic() {
     CHECK(order->price     == 15025,      "Price correct");
 }
 
-void test_execution_report_fill() {
+static void test_execution_report_fill() {
     printf("ExecutionReport fill parse:\n");
-    std::string header = fix_msg("8=FIX.4.2|9=200|35=8|49=TARGET|56=SENDER|34=2|52=20230901-09:30:00.100|");
-    std::string body   = fix_msg("37=ORD001|17=EXEC001|11=CLORD001|55=AAPL|54=1|150=2|39=2|151=0|14=100|6=15025|");
-    std::string full   = header + body + checksum_field(header + body);
-    auto span   = std::span<const char>(full.data(), full.size());
-    auto report = fix::ExecutionReport::from(span);
-    CHECK(report.has_value(),              "ExecutionReport parsed");
-    CHECK(report->order_id  == "ORD001",   "OrderID correct");
-    CHECK(report->exec_id   == "EXEC001",  "ExecID correct");
-    CHECK(report->exec_type == '2',        "ExecType=Filled");
-    CHECK(report->leaves_qty == 0,         "LeavesQty=0");
-    CHECK(report->cum_qty    == 100,       "CumQty=100");
-    CHECK(report->avg_px     == 15025,     "AvgPx=15025");
+    auto full = build(soh("35=8|49=TARGET|56=SENDER|34=2|52=20230901-09:30:00.100|"
+                          "37=ORD001|17=EXEC001|11=CLORD001|55=AAPL|54=1|150=2|39=2|151=0|14=100|6=15025|"));
+    auto r = fix::ExecutionReport::from(sp(full));
+    CHECK(r.has_value(),             "ExecutionReport parsed");
+    CHECK(r->order_id  == "ORD001",  "OrderID correct");
+    CHECK(r->exec_id   == "EXEC001", "ExecID correct");
+    CHECK(r->exec_type == '2',       "ExecType=Filled");
+    CHECK(r->leaves_qty == 0,        "LeavesQty=0");
+    CHECK(r->cum_qty    == 100,      "CumQty=100");
+    CHECK(r->avg_px     == 15025,    "AvgPx=15025");
 }
 
-void test_checksum_verification() {
-    printf("Checksum verification:\n");
-    std::string header = fix_msg("8=FIX.4.2|9=50|35=0|49=SENDER|56=TARGET|34=1|52=20230901-09:30:00|");
-    std::string full   = header + checksum_field(header);
-    auto span   = std::span<const char>(full.data(), full.size());
-    auto result = fix::Parser::parse(span, [](fix::Field){});
-    CHECK(result.error == fix::ParseError::Ok, "valid checksum accepted");
+static void test_checksum_and_bodylength() {
+    printf("Checksum + BodyLength verification:\n");
+    auto full = build(soh("35=0|49=SENDER|56=TARGET|34=1|52=20230901-09:30:00|"));
+    auto res = Parser::parse(sp(full), [](Field){});
+    CHECK(res.error == ParseError::Ok, "valid message accepted");
+    CHECK(res.body_length == res.body_observed, "body length reconciles");
 
-    std::string corrupt = full;
-    corrupt[10] ^= 0x01;
-    auto corrupt_span = std::span<const char>(corrupt.data(), corrupt.size());
-    result = fix::Parser::parse(corrupt_span, [](fix::Field){});
-    CHECK(result.error == fix::ParseError::ChecksumMismatch, "corrupt checksum rejected");
+    std::string corrupt = full; corrupt[20] ^= 0x01;
+    res = Parser::parse(sp(corrupt), [](Field){});
+    CHECK(res.error == ParseError::ChecksumMismatch, "corrupt byte → ChecksumMismatch");
+
+    // Lie about BodyLength: declared 5 bytes short. Checksum is recomputed
+    // so only the length check can catch it.
+    std::string body = soh("35=0|49=A|56=B|34=1|");
+    std::string lie = "8=FIX.4.4\x01" "9=" + std::to_string(body.size() - 5) + "\x01" + body;
+    char buf[16]; snprintf(buf, sizeof buf, "10=%03d\x01", int(fix::compute_checksum(sp(lie))));
+    lie += buf;
+    res = Parser::parse(sp(lie), [](Field){});
+    CHECK(res.error == ParseError::InvalidBodyLength, "wrong BodyLength rejected");
+
+    // Truncated before tag 10.
+    std::string cut = full.substr(0, full.size() - 7);
+    res = Parser::parse(sp(cut), [](Field){});
+    CHECK(res.error == ParseError::UnexpectedEnd, "missing CheckSum → UnexpectedEnd");
+
+    // Does not start with tag 8.
+    auto bad = soh("35=0|8=FIX.4.4|10=000|");
+    res = Parser::parse(sp(bad), [](Field){});
+    CHECK(res.error == ParseError::MissingBeginString, "first tag must be 8");
 }
 
-void test_parse_fast_msgtype_seqnum() {
-    printf("parse_fast (MsgType + SeqNum only):\n");
-    std::string header = fix_msg("8=FIX.4.2|9=178|35=D|49=SENDER|56=TARGET|34=42|52=20230901-09:30:00|");
-    std::string body   = fix_msg("11=CLORD001|55=AAPL|54=1|38=100|40=2|44=15025|");
-    std::string full   = header + body + checksum_field(header + body);
-    auto span   = std::span<const char>(full.data(), full.size());
-    auto result = fix::Parser::parse_fast(span);
-    CHECK(result.msg_type_char == int('D'), "MsgType=D");
-    CHECK(result.seq_num == 42,             "SeqNum=42");
-}
-
-void test_field_iteration() {
-    printf("Field iteration:\n");
-    std::string header = fix_msg("8=FIX.4.2|9=100|35=A|49=SENDER|56=TARGET|34=1|52=20230901-09:30:00|");
-    std::string body   = fix_msg("98=0|108=30|");
-    std::string full   = header + body + checksum_field(header + body);
-    int tag_count = 0; bool found_35 = false;
-    auto span = std::span<const char>(full.data(), full.size());
-    fix::Parser::parse(span, [&](fix::Field f) {
-        ++tag_count;
-        if (f.tag == 35 && f.value == "A") found_35 = true;
+static void test_data_field_with_embedded_soh() {
+    printf("Length-prefixed data fields (SOH inside RawData):\n");
+    // RawData contains SOH, '=', and a fake "10=000" — all must be opaque.
+    std::string raw = "\x01" "10=000" "\x01" "35=D" "\x01";
+    std::string body = soh("35=0|49=A|56=B|34=7|") + "95=" + std::to_string(raw.size()) +
+                       "\x01" + "96=" + raw + "\x01" + soh("108=30|");
+    auto full = build(body);
+    std::string_view seen_raw; int seen_108 = 0; int count = 0;
+    auto res = Parser::parse(sp(full), [&](Field f) {
+        ++count;
+        if (f.tag == 96)  seen_raw = f.value;
+        if (f.tag == 108) seen_108 = 1;
     });
-    CHECK(tag_count >= 8, "all fields visited");
-    CHECK(found_35,       "tag 35 found with value A");
+    CHECK(res.error == ParseError::Ok,        "message with binary RawData parses");
+    CHECK(seen_raw == raw,                    "RawData returned verbatim including SOH");
+    CHECK(seen_108 == 1,                      "field after RawData still visited");
+    CHECK(res.seq_num == 7,                   "SeqNum correct");
+    CHECK(count == 9, "all 9 non-checksum fields visited");
+
+    // Declared length longer than the wire → MalformedDataField, never OOB.
+    std::string bad_body = soh("35=0|49=A|56=B|34=1|95=999|96=abc|");
+    auto bad = build(bad_body);
+    res = Parser::parse(sp(bad), [](Field){});
+    CHECK(res.error == ParseError::MalformedDataField, "over-long data length rejected");
+
+    // Negative length.
+    auto neg = build(soh("35=0|49=A|56=B|34=1|95=-1|96=abc|"));
+    res = Parser::parse(sp(neg), [](Field){});
+    CHECK(res.error == ParseError::MalformedDataField, "negative data length rejected");
 }
 
-void test_side_values() {
-    printf("Side field parsing:\n");
-    auto make_order = [](char side_char) {
-        std::string body = std::string("8=FIX.4.2\x01""9=100\x01""35=D\x01"
-            "49=A\x01""56=B\x01""34=1\x01""52=20230901-09:30:00\x01"
-            "11=C\x01""55=AAPL\x01""54=");
-        body += side_char;
-        body += "\x01""38=100\x01""40=2\x01""44=100\x01";
-        body += checksum_field(body);
-        return body;
-    };
-    auto buy  = make_order('1');
-    auto sell = make_order('2');
-    auto buy_order  = fix::NewOrderSingle::from({buy.data(),  buy.size()});
-    auto sell_order = fix::NewOrderSingle::from({sell.data(), sell.size()});
-    CHECK(buy_order.has_value()  && buy_order->side  == '1', "Buy side=1");
-    CHECK(sell_order.has_value() && sell_order->side == '2', "Sell side=2");
-}
-
-void test_empty_message() {
-    printf("Edge cases:\n");
-    auto empty = fix::Parser::parse({}, [](fix::Field){});
-    CHECK(empty.error == fix::ParseError::EmptyMessage, "empty message error");
-}
-
-void test_multiple_message_types() {
-    printf("Multiple message types:\n");
+static void test_parse_fast() {
+    printf("parse_fast (MsgType + SeqNum only):\n");
+    auto full = build(soh("35=D|49=SENDER|56=TARGET|34=42|52=20230901-09:30:00|11=X|55=AAPL|54=1|38=100|40=2|44=15025|"));
+    auto res = Parser::parse_fast(sp(full));
+    CHECK(res.msg_type_char == int('D'), "MsgType=D");
+    CHECK(res.seq_num == 42,             "SeqNum=42");
     const char* types[] = {"D","8","F","0","A","5"};
-    const char* names[] = {"NewOrderSingle","ExecutionReport","OrderCancel",
-                           "Heartbeat","Logon","Logout"};
-    for (int i = 0; i < 6; ++i) {
-        std::string msg = std::string("8=FIX.4.2\x01""9=50\x01""35=") +
-                          types[i] + "\x01""49=A\x01""56=B\x01""34=1\x01";
-        msg += checksum_field(msg);
-        auto result = fix::Parser::parse_fast({msg.data(), msg.size()});
-        CHECK(result.msg_type_char == int(types[i][0]),
-              (std::string("MsgType ") + names[i]).c_str());
+    for (auto t : types) {
+        auto m = build(std::string("35=") + t + soh("|49=A|56=B|34=1|"));
+        CHECK(Parser::parse_fast(sp(m)).msg_type_char == int(t[0]), "MsgType round-trip");
     }
 }
 
-void test_large_quantities() {
-    printf("Large integer parsing:\n");
-    std::string body = std::string("8=FIX.4.2\x01""9=100\x01""35=D\x01"
-        "49=A\x01""56=B\x01""34=999999\x01""38=1000000\x01""44=9999999\x01"
-        "11=X\x01""55=Y\x01""54=1\x01""40=2\x01");
-    body += checksum_field(body);
-    auto order = fix::NewOrderSingle::from({body.data(), body.size()});
-    CHECK(order.has_value() && order->order_qty == 1000000, "large OrderQty");
-    CHECK(order.has_value() && order->price     == 9999999, "large Price");
+static void test_malformed_tags() {
+    printf("Malformed tags:\n");
+    auto r1 = Parser::parse(sp(soh("8=FIX.4.4|9=5|=abc|10=000|")), [](Field){});
+    CHECK(r1.error == ParseError::MalformedTag, "empty tag rejected");
+    auto r2 = Parser::parse(sp(soh("8=FIX.4.4|9=5|1234567=x|10=000|")), [](Field){});
+    CHECK(r2.error == ParseError::MalformedTag, "7-digit tag rejected");
+    auto r3 = Parser::parse(sp(soh("8=FIX.4.4|9=5|3a=x|10=000|")), [](Field){});
+    CHECK(r3.error == ParseError::MalformedTag, "non-digit in tag rejected");
+    auto r4 = Parser::parse(sp(std::string("8=FIX.4.4\x01" "9=5\x01" "35=D")), [](Field){});
+    CHECK(r4.error == ParseError::UnexpectedEnd, "unterminated value rejected");
+    auto e = Parser::parse({}, [](Field){});
+    CHECK(e.error == ParseError::EmptyMessage, "empty message error");
 }
 
-void test_string_view_zero_copy() {
+static void test_long_values_cross_simd_boundary() {
+    printf("Values longer than one SIMD lane (32B) and 64B:\n");
+    std::string v33(33, 'x'), v64(64, 'y'), v100(100, 'z');
+    auto full = build(soh("35=D|49=A|56=B|34=1|11=") + v33 + "\x01" "58=" + v64 + "\x01" "55=" + v100 + "\x01");
+    std::string_view a, b, c;
+    auto res = Parser::parse(sp(full), [&](Field f) {
+        if (f.tag == 11) a = f.value;
+        if (f.tag == 58) b = f.value;
+        if (f.tag == 55) c = f.value;
+    });
+    CHECK(res.error == ParseError::Ok, "long values parse");
+    CHECK(a == v33 && b == v64 && c == v100, "long values exact");
+}
+
+static void test_simd_scalar_equivalence() {
+    printf("SIMD vs scalar equivalence on random buffers:\n");
+    std::mt19937_64 rng(42);
+    int mismatches = 0;
+    for (int iter = 0; iter < 5000; ++iter) {
+        size_t n = rng() % 300;
+        std::vector<char> buf(n);
+        for (auto& ch : buf) ch = char(rng() % 256);
+        const char* b = buf.data(); const char* e = b + n;
+        for (char needle : {'\x01', '=', '\0', char(0xff)}) {
+            if (fix::simd::find_byte(b, e, needle) != fix::simd::find_byte_scalar(b, e, needle)) ++mismatches;
+        }
+        if (fix::simd::sum_bytes(b, e) != fix::simd::sum_bytes_scalar(b, e)) ++mismatches;
+        // sub-slices at odd offsets
+        if (n > 5) {
+            const char* b2 = b + 3;
+            if (fix::simd::sum_bytes(b2, e) != fix::simd::sum_bytes_scalar(b2, e)) ++mismatches;
+        }
+    }
+    CHECK(mismatches == 0, "find_byte and sum_bytes agree with scalar on 5000 random buffers");
+    printf("  AVX2 path compiled: %s\n", FIX_HAVE_AVX2 ? "yes" : "no");
+}
+
+static void test_zero_copy() {
     printf("Zero-copy: string_view into original buffer:\n");
-    std::string body = std::string("8=FIX.4.2\x01""9=100\x01""35=D\x01"
-        "49=A\x01""56=B\x01""34=1\x01""11=ORDER_ID_123\x01"
-        "55=GOOGL\x01""54=1\x01""38=50\x01""40=2\x01""44=14000\x01");
-    body += checksum_field(body);
-    auto order = fix::NewOrderSingle::from({body.data(), body.size()});
+    auto full = build(soh("35=D|49=A|56=B|34=1|11=ORDER_ID_123|55=GOOGL|54=1|38=50|40=2|44=14000|"));
+    auto order = fix::NewOrderSingle::from(sp(full));
     CHECK(order.has_value(), "parsed");
-    const char* cl_ord_start = order->cl_ord_id.data();
-    CHECK(cl_ord_start >= body.data() && cl_ord_start < body.data() + body.size(),
-          "cl_ord_id points into original buffer (zero copy)");
-    const char* sym_start = order->symbol.data();
-    CHECK(sym_start >= body.data() && sym_start < body.data() + body.size(),
-          "symbol points into original buffer (zero copy)");
+    auto inside = [&](std::string_view v) {
+        return v.data() >= full.data() && v.data() < full.data() + full.size(); };
+    CHECK(inside(order->cl_ord_id) && inside(order->symbol), "fields point into original buffer");
+}
+
+static void test_large_ints() {
+    printf("Large integer parsing:\n");
+    auto full = build(soh("35=D|49=A|56=B|34=999999|38=1000000|44=9999999|11=X|55=Y|54=1|40=2|"));
+    auto o = fix::NewOrderSingle::from(sp(full));
+    CHECK(o && o->order_qty == 1000000 && o->price == 9999999, "large ints");
+    CHECK(!Parser::parse_int("12a"), "trailing garbage rejected");
+    CHECK(!Parser::parse_int(""),    "empty int rejected");
 }
 
 int main() {
     printf("=== FIX 4.2/4.4 Parser Tests ===\n\n");
     test_new_order_single_basic();
     test_execution_report_fill();
-    test_checksum_verification();
-    test_parse_fast_msgtype_seqnum();
-    test_field_iteration();
-    test_side_values();
-    test_empty_message();
-    test_multiple_message_types();
-    test_large_quantities();
-    test_string_view_zero_copy();
-    printf("\n================================\n");
-    printf("Results: %d passed, %d failed\n", passed, failed);
-    return failed > 0 ? 1 : 0;
+    test_checksum_and_bodylength();
+    test_data_field_with_embedded_soh();
+    test_parse_fast();
+    test_malformed_tags();
+    test_long_values_cross_simd_boundary();
+    test_simd_scalar_equivalence();
+    test_zero_copy();
+    test_large_ints();
+    printf("\nResults: %d passed, %d failed\n", g_passed, g_failed);
+    return g_failed > 0 ? 1 : 0;
 }

@@ -1,44 +1,59 @@
-# Benchmark Results — FIX 4.2/4.4 Parser
+# Benchmark Results
+
+Every row here was produced by `bench/bench_parser.cpp` and pasted verbatim.
+Re-run on your own hardware before quoting a number; results differ by 2× across
+CPU generations.
+
+## Run 1 — shared cloud container (NOT an isolated core)
+
+```
+CPU        : Intel(R) Xeon(R) Processor @ 2.10GHz
+Compiler   : GCC 13.3.0, -O3 -march=native
+AVX2       : yes
+Message    : 150 bytes NewOrderSingle, 171 bytes NewOrderMultileg
+Iterations : 2000000 (+200k warm-up)
+Isolation  : none (container, no taskset/chrt)
+
+Method                           p50     p90     p99   p99.9
+Full parse (all fields)         141ns   143ns   144ns   208ns
+Fast parse (type+seq)            75ns    76ns    81ns   101ns
+Typed NewOrderSingle            189ns   199ns   350ns   570ns
+Group parse (multileg)          549ns   559ns   771ns  4266ns
+```
+
+Notes:
+- Full parse now includes BodyLength verification and the data-field table
+  lookup, which the previous version did not do. The ~20 ns of per-iteration
+  `steady_clock` overhead is included in every row.
+- Max values (not shown) were 200–500 µs: container scheduler preemption.
+  This is exactly why the isolated-core run below is the one to quote.
+
+## Run 2 — isolated core
+
+_Not yet recorded. Run `taskset -c <core> chrt -f 50 ./build/bench_parser`
+on a machine with `isolcpus`/`nohz_full` and paste the output here._
 
 ## Test results
 
 ```
-35 tests passed, 0 failed
-
-  NewOrderSingle parse    : all fields correct
-  ExecutionReport parse   : all fields correct
-  Checksum verification   : valid accepted, corrupt rejected
-  parse_fast              : MsgType + SeqNum extracted correctly
-  Field iteration         : all tags visited in order
-  Side values             : buy/sell correctly parsed
-  Edge cases              : empty message handled
-  Multiple message types  : D/8/F/0/A/5 all correct
-  Large quantities        : 1,000,000 shares, price 9,999,999
-  Zero-copy               : string_views point into original buffer
+test_parser  : 48 passed, 0 failed   (incl. SIMD/scalar equivalence on 5000 random buffers)
+test_groups  : 91 passed, 0 failed   (nested NoLegs→NoNestedPartyIDs, MD incremental, count mismatch)
+test_session : 31 passed, 0 failed
+ASan + UBSan : clean
 ```
 
-## Latency (171-byte NewOrderSingle)
+## Baseline vs hffix — same machine, same message
 
 ```
-Method                  p50     p90     p99    p99.9
-Full parse (all fields) 112 ns  158 ns  220 ns  401 ns
-Fast parse (type+seq)    60 ns   61 ns  112 ns  190 ns
+Message : 107 bytes NewOrderSingle (built by hffix::message_writer)
+Container, no core isolation.
+
+Method                                  p50     p90     p99    p99.9
+fix-parser full parse (+ checksum)     126ns   128ns   142ns   208ns
+fix-parser fast parse (no checksum)     70ns    72ns    85ns   178ns
+hffix full iteration (no checksum)     100ns   101ns   103ns   155ns
+hffix fast exit (no checksum)           53ns    55ns    65ns   114ns
 ```
 
-## Design decisions
-
-**Zero-copy:** `std::string_view` fields point directly into the receive buffer.
-No `memcpy`, no `std::string` construction on the parse path.
-
-**Zero-alloc:** All state on the stack. No heap allocation.
-
-**Checksum in one pass:** Accumulated as bytes are consumed in `parse_value()`.
-Tag 10 bytes subtracted at end — one pass, no second scan.
-
-**`__builtin_expect`:** SOH delimiter is rare relative to value bytes.
-Branch predictor predicts "not SOH" — correct ~95% of the time.
-
-**`std::from_chars`:** No locale, no NUL-termination required, no exception.
-
-**`parse_fast`:** Stops after tag 35 + tag 34. Saves ~52ns per message
-for sequence gap detection before full parse.
+hffix does not verify the checksum; fix-parser full does.
+Checksum cost: ~52 ns p50. See PROFILING.md for analysis.
