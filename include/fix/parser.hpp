@@ -111,6 +111,7 @@ enum class ParseError : uint8_t {
     MalformedTag,
     MalformedValue,
     MalformedDataField,   // data field length disagrees with wire
+    DuplicateHeaderField, // tag 35 or 34 appears more than once before CheckSum
 };
 
 [[nodiscard]] constexpr const char* to_string(ParseError e) noexcept {
@@ -124,6 +125,7 @@ enum class ParseError : uint8_t {
         case ParseError::MalformedTag:       return "MalformedTag";
         case ParseError::MalformedValue:     return "MalformedValue";
         case ParseError::MalformedDataField: return "MalformedDataField";
+        case ParseError::DuplicateHeaderField: return "DuplicateHeaderField";
     }
     return "?";
 }
@@ -208,6 +210,8 @@ public:
         int64_t     pending_data_len = 0;
         bool        first = true;
         bool        saw_checksum = false;
+        bool        saw_msg_type = false;
+        bool        saw_seq_num  = false;
 
         while (p < end) {
             const char* field_start = p;
@@ -244,8 +248,12 @@ public:
             checksum += simd::sum_bytes(field_start, p);
 
             if (tag == Tag::MsgType) {
+                if (__builtin_expect(saw_msg_type, 0)) { r.error = ParseError::DuplicateHeaderField; return r; }
+                saw_msg_type = true;
                 if (!value->empty()) r.msg_type_char = int((*value)[0]);
             } else if (tag == Tag::MsgSeqNum) {
+                if (__builtin_expect(saw_seq_num, 0)) { r.error = ParseError::DuplicateHeaderField; return r; }
+                saw_seq_num = true;
                 if (auto n = parse_int(*value)) r.seq_num = uint32_t(*n);
             } else if (tag == Tag::BodyLength) {
                 auto n = parse_int(*value);
@@ -292,9 +300,11 @@ public:
             if (!value) { r.error = ParseError::UnexpectedEnd; return r; }
 
             if (tag == Tag::MsgType) {
+                if (__builtin_expect(found_type, 0)) { r.error = ParseError::DuplicateHeaderField; return r; }
                 if (!value->empty()) r.msg_type_char = int((*value)[0]);
                 found_type = true;
             } else if (tag == Tag::MsgSeqNum) {
+                if (__builtin_expect(found_seq, 0)) { r.error = ParseError::DuplicateHeaderField; return r; }
                 if (auto n = parse_int(*value)) r.seq_num = uint32_t(*n);
                 found_seq = true;
             } else if (tag == Tag::CheckSum) {
